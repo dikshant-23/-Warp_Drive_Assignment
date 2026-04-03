@@ -1,275 +1,418 @@
 """
-Customer feature computation pipeline.
+Recommendation Feature Pipeline — Task 2
 
-Reads from the events table, computes behavioural features,
-and upserts into customer_features.
+Computes two feature sets from the events table:
+
+1. customer_features  (one row per customer)
+2. product_cooccurrence
 """
 
 import asyncio
-import sys
+import argparse
+import logging
 from datetime import datetime, timezone
 
 import asyncpg
 
-DSN = "postgresql://aira_admin:secret@127.0.0.1:5432/aira"
-PIPELINE_NAME = "customer_features_v1"
+ADMIN_DSN = "postgresql://aira_admin:secret@127.0.0.1:5432/aira"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-async def get_tenants(conn):
-    return await conn.fetch("SELECT id, slug FROM tenants ORDER BY created_at")
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
 
-
-async def get_checkpoint(conn, tenant_id: str) -> datetime:
+async def get_checkpoint(conn, tenant_id: str, pipeline_name: str) -> datetime | None:
     row = await conn.fetchrow(
         """
-        SELECT last_processed_at FROM pipeline_checkpoints
-        WHERE tenant_id = $1 AND pipeline_name = $2
+        SELECT last_processed_at
+          FROM pipeline_checkpoints
+         WHERE tenant_id = $1::uuid AND pipeline_name = $2
         """,
-        tenant_id, PIPELINE_NAME,
+        tenant_id, pipeline_name,
     )
-    return row["last_processed_at"] if row else datetime(2000, 1, 1, tzinfo=timezone.utc)
+    return row["last_processed_at"] if row else None
 
 
-async def update_checkpoint(conn, tenant_id: str, ts: datetime):
+async def update_checkpoint(conn, tenant_id: str, pipeline_name: str, ts: datetime):
     await conn.execute(
         """
         INSERT INTO pipeline_checkpoints (tenant_id, pipeline_name, last_processed_at)
-        VALUES ($1, $2, $3)
+        VALUES ($1::uuid, $2, $3)
         ON CONFLICT (tenant_id, pipeline_name)
         DO UPDATE SET last_processed_at = EXCLUDED.last_processed_at,
-                      updated_at        = now()
+                      updated_at = now()
         """,
-        tenant_id, PIPELINE_NAME, ts,
+        tenant_id, pipeline_name, ts,
     )
 
 
-async def compute_customer_features(conn, tenant_id: str, since: datetime) -> int:
+# ---------------------------------------------------------------------------
+# Customer features pipeline
+# ---------------------------------------------------------------------------
+
+async def compute_customer_features(conn, tenant_id: str, since: datetime | None):
     """
-    Compute all features for customers active since the checkpoint.
+    Single CTE chain — all feature groups computed in one SQL statement,
+    then bulk-upserted into customer_features.
 
-    Uses a single CTE chain — one round trip to the DB per tenant.
-    The CTEs build on each other: events → counts → affinity → velocity → sessions.
+    Window: 30 days back from now (or from checkpoint for incremental runs,
+    but we still look back 30 days for velocity/session accuracy).
     """
-    # Find customers with activity since last checkpoint (scopes the work)
-    active = await conn.fetch(
-        "SELECT DISTINCT customer_id FROM events WHERE tenant_id = $1 AND timestamp > $2",
-        tenant_id, since,
-    )
-    if not active:
-        return 0
+    log.info("customer_features: since=%s", since)
 
-    active_ids = [r["customer_id"] for r in active]
+    thirty_days_ago = "now() - interval '30 days'"
+    if since is None:
+        window_filter = f"e.timestamp >= {thirty_days_ago}"
+        params = [tenant_id]
+    else:
+        # Incremental: re-process from 30 days ago or the checkpoint,
+        # whichever is earlier, so velocity/session windows stay accurate.
+        window_filter = f"e.timestamp >= LEAST($2, {thirty_days_ago})"
+        params = [tenant_id, since]
 
-    result = await conn.execute(
-        """
-        WITH
-        -- All events for active customers (full history, not just since checkpoint)
-        base AS (
-            SELECT
-                e.customer_id,
-                e.event_type,
-                e.product_id,
-                e.timestamp,
-                p.category,
-                p.price
-            FROM events e
-            LEFT JOIN products p
-                   ON p.id = e.product_id AND p.tenant_id = e.tenant_id
-            WHERE e.tenant_id = $1
-              AND e.customer_id = ANY($2)
+    sql = f"""
+        WITH raw_events AS (
+            SELECT e.customer_id,
+                   e.product_id,
+                   e.event_type,
+                   e.timestamp,
+                   p.category,
+                   p.price
+              FROM events e
+              LEFT JOIN products p ON p.id = e.product_id
+             WHERE e.tenant_id = $1::uuid
+               AND {window_filter}
         ),
 
-        -- Core behavioural counts
-        behavioral AS (
-            SELECT
-                customer_id,
-                COUNT(*)          FILTER (WHERE event_type = 'page_view')   AS total_views,
-                COUNT(*)          FILTER (WHERE event_type = 'add_to_cart') AS total_cart_adds,
-                COUNT(*)          FILTER (WHERE event_type = 'purchase')    AS total_purchases,
-                COUNT(DISTINCT product_id)                                  AS distinct_products_viewed,
-                COUNT(DISTINCT category)                                    AS distinct_categories_viewed,
-                SUM(price)        FILTER (WHERE event_type = 'purchase')    AS total_revenue,
-                MIN(timestamp)                                              AS first_event_at,
-                MAX(timestamp)                                              AS last_event_at
-            FROM base
-            GROUP BY customer_id
+        -- ── Per-customer event aggregates ─────────────────────────────────
+        agg AS (
+            SELECT customer_id,
+                   COUNT(*) FILTER (WHERE event_type = 'page_view')
+                       AS total_views,
+                   COUNT(*) FILTER (WHERE event_type = 'add_to_cart')
+                       AS total_cart_adds,
+                   COUNT(*) FILTER (WHERE event_type = 'purchase')
+                       AS total_purchases,
+                   COUNT(DISTINCT product_id)
+                       FILTER (WHERE event_type IN ('page_view', 'product_view', 'purchase')
+                                 AND product_id IS NOT NULL)
+                       AS distinct_products_viewed,
+                   COUNT(DISTINCT category)
+                       FILTER (WHERE event_type IN ('page_view', 'product_view', 'purchase')
+                                 AND category IS NOT NULL)
+                       AS distinct_categories_viewed
+              FROM raw_events
+             GROUP BY customer_id
         ),
 
-        -- Category affinity: views in last 7d = 3x weight, last 30d = 1x weight.
-        category_raw AS (
-            SELECT
-                customer_id,
-                category,
-                SUM(CASE
-                    WHEN timestamp > now() - INTERVAL '7 days'  THEN 3
-                    WHEN timestamp > now() - INTERVAL '30 days' THEN 1
-                    ELSE 0
-                END) AS weighted_views
-            FROM base
-            WHERE event_type IN ('page_view', 'product_view')
-              AND category IS NOT NULL
-            GROUP BY customer_id, category
-        ),
-        category_totals AS (
-            SELECT customer_id, SUM(weighted_views) AS total_weight
-            FROM category_raw GROUP BY customer_id
-        ),
-        category_affinity AS (
-            SELECT
-                r.customer_id,
-                jsonb_object_agg(
-                    r.category,
-                    ROUND((r.weighted_views::NUMERIC / NULLIF(t.total_weight, 0))::NUMERIC, 4)
-                ) AS affinity_vector
-            FROM category_raw r
-            JOIN category_totals t USING (customer_id)
-            WHERE r.weighted_views > 0
-            GROUP BY r.customer_id
+        -- ── Days since first seen / last activity ─────────────────────────
+        -- first_seen comes from the customers table; last_activity from events
+        activity AS (
+            SELECT re.customer_id,
+                   EXTRACT(EPOCH FROM (now() - c.first_seen)) / 86400.0
+                       AS days_since_first_seen,
+                   EXTRACT(EPOCH FROM (now() - MAX(re.timestamp))) / 86400.0
+                       AS days_since_last_activity
+              FROM raw_events re
+              JOIN customers c ON c.id = re.customer_id
+                               AND c.tenant_id = $1::uuid
+             GROUP BY re.customer_id, c.first_seen
         ),
 
-        -- Purchase velocity: gap between consecutive purchases using LAG
-        purchase_events AS (
-            SELECT
-                customer_id,
-                timestamp,
-                price,
-                LAG(timestamp) OVER (PARTITION BY customer_id ORDER BY timestamp) AS prev_purchase
-            FROM base
-            WHERE event_type = 'purchase'
+        -- ── Category affinity (recency-weighted, normalised) ──────────────
+        category_events AS (
+            SELECT customer_id,
+                   category,
+                   CASE
+                     WHEN timestamp >= now() - interval '7 days' THEN 3.0
+                     ELSE 1.0
+                   END AS weight
+              FROM raw_events
+             WHERE category IS NOT NULL
+               AND event_type IN ('page_view', 'product_view', 'purchase')
         ),
-        purchase_velocity AS (
-            SELECT
-                customer_id,
-                AVG(EXTRACT(EPOCH FROM (timestamp - prev_purchase)) / 86400) AS avg_days_between_purchases,
-                AVG(price) AS avg_order_value
-            FROM purchase_events
-            WHERE prev_purchase IS NOT NULL
-            GROUP BY customer_id
+        affinity_raw AS (
+            SELECT customer_id,
+                   category,
+                   SUM(weight) AS raw_score
+              FROM category_events
+             GROUP BY customer_id, category
+        ),
+        affinity_norm AS (
+            SELECT customer_id,
+                   category,
+                   raw_score,
+                   SUM(raw_score) OVER (PARTITION BY customer_id) AS total_score
+              FROM affinity_raw
+        ),
+        affinity_final AS (
+            SELECT customer_id,
+                   jsonb_object_agg(
+                       category,
+                       ROUND((raw_score / total_score)::numeric, 4)
+                   ) AS category_affinity
+              FROM affinity_norm
+             GROUP BY customer_id
         ),
 
-        -- Session features: events within 30-min gaps = same session
-        session_boundaries AS (
-            SELECT
-                customer_id,
-                timestamp,
-                product_id,
-                CASE
-                    WHEN timestamp - LAG(timestamp) OVER (PARTITION BY customer_id ORDER BY timestamp)
-                         > INTERVAL '30 minutes'
-                    THEN 1 ELSE 0
-                END AS is_new_session
-            FROM base
+        -- ── Purchase velocity & revenue ───────────────────────────────────
+        purchase_rows AS (
+            SELECT customer_id,
+                   timestamp,
+                   price,
+                   LAG(timestamp) OVER (PARTITION BY customer_id ORDER BY timestamp)
+                       AS prev_ts
+              FROM raw_events
+             WHERE event_type = 'purchase'
         ),
-        session_ids AS (
-            SELECT
-                customer_id,
-                timestamp,
-                product_id,
-                SUM(is_new_session) OVER (PARTITION BY customer_id ORDER BY timestamp) AS session_num
-            FROM session_boundaries
+        purchase_stats AS (
+            SELECT customer_id,
+                   COUNT(*)  / 30.0                                      AS purchase_velocity_30d,
+                   AVG(EXTRACT(EPOCH FROM (timestamp - prev_ts)) / 86400.0)
+                                                                          AS avg_days_between_purchases,
+                   SUM(price)                                             AS total_revenue,
+                   AVG(price)                                             AS avg_order_value
+              FROM purchase_rows
+             GROUP BY customer_id
         ),
-        per_session AS (
-            SELECT
-                customer_id,
-                session_num,
-                EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) / 60 AS duration_mins,
-                COUNT(DISTINCT product_id) AS products_viewed
-            FROM session_ids
-            GROUP BY customer_id, session_num
+
+        -- ── Session features (30-min idle gap = new session) ──────────────
+        session_gaps AS (
+            SELECT customer_id,
+                   product_id,
+                   timestamp,
+                   LAG(timestamp) OVER (PARTITION BY customer_id ORDER BY timestamp)
+                       AS prev_ts
+              FROM raw_events
         ),
-        session_agg AS (
-            SELECT
-                customer_id,
-                AVG(duration_mins)    AS avg_session_duration_mins,
-                AVG(products_viewed)  AS avg_products_per_session
-            FROM per_session
-            WHERE products_viewed > 1  -- single-product sessions have no useful signal
-            GROUP BY customer_id
+        session_starts AS (
+            SELECT customer_id,
+                   product_id,
+                   timestamp,
+                   SUM(
+                       CASE WHEN prev_ts IS NULL
+                                 OR timestamp - prev_ts > interval '30 minutes'
+                            THEN 1 ELSE 0 END
+                   ) OVER (PARTITION BY customer_id ORDER BY timestamp)
+                       AS session_id
+              FROM session_gaps
+        ),
+        session_metrics AS (
+            SELECT customer_id,
+                   session_id,
+                   EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) / 60.0
+                       AS length_min,
+                   COUNT(DISTINCT product_id) FILTER (WHERE product_id IS NOT NULL)
+                       AS products_viewed
+              FROM session_starts
+             GROUP BY customer_id, session_id
+        ),
+        session_stats AS (
+            SELECT customer_id,
+                   AVG(length_min)      AS avg_session_length_min,
+                   AVG(products_viewed) AS avg_products_per_session
+              FROM session_metrics
+             GROUP BY customer_id
+        ),
+
+        -- ── Combine all signals ───────────────────────────────────────────
+        combined AS (
+            SELECT af.customer_id,
+                   af.category_affinity,
+                   COALESCE(a.total_views,               0) AS total_views,
+                   COALESCE(a.total_cart_adds,           0) AS total_cart_adds,
+                   COALESCE(a.total_purchases,           0) AS total_purchases,
+                   COALESCE(a.distinct_products_viewed,  0) AS distinct_products_viewed,
+                   COALESCE(a.distinct_categories_viewed,0) AS distinct_categories_viewed,
+                   COALESCE(act.days_since_first_seen,   0) AS days_since_first_seen,
+                   COALESCE(act.days_since_last_activity,0) AS days_since_last_activity,
+                   COALESCE(ps.purchase_velocity_30d,    0) AS purchase_velocity_30d,
+                   COALESCE(ps.avg_days_between_purchases, NULL) AS avg_days_between_purchases,
+                   COALESCE(ps.total_revenue,            0) AS total_revenue,
+                   COALESCE(ps.avg_order_value,          NULL) AS avg_order_value,
+                   COALESCE(ss.avg_session_length_min,   0) AS avg_session_length_min,
+                   COALESCE(ss.avg_products_per_session, 0) AS avg_products_per_session
+              FROM affinity_final af
+              LEFT JOIN agg           a   USING (customer_id)
+              LEFT JOIN activity      act USING (customer_id)
+              LEFT JOIN purchase_stats ps  USING (customer_id)
+              LEFT JOIN session_stats  ss  USING (customer_id)
         )
 
         INSERT INTO customer_features (
             tenant_id, customer_id,
+            category_affinity,
             total_views, total_cart_adds, total_purchases,
             distinct_products_viewed, distinct_categories_viewed,
             days_since_first_seen, days_since_last_activity,
-            category_affinity,
-            avg_days_between_purchases, total_revenue, avg_order_value,
-            avg_session_duration_mins, avg_products_per_session,
+            purchase_velocity_30d, avg_days_between_purchases,
+            total_revenue, avg_order_value,
+            avg_session_length_min, avg_products_per_session,
             computed_at
         )
-        SELECT
-            $1::uuid,
-            b.customer_id,
-            b.total_views,
-            b.total_cart_adds,
-            b.total_purchases,
-            b.distinct_products_viewed,
-            b.distinct_categories_viewed,
-            EXTRACT(EPOCH FROM (now() - b.first_event_at)) / 86400,
-            EXTRACT(EPOCH FROM (now() - b.last_event_at))  / 86400,
-            COALESCE(ca.affinity_vector, '{}'::jsonb),
-            pv.avg_days_between_purchases,
-            COALESCE(b.total_revenue, 0),
-            pv.avg_order_value,
-            sa.avg_session_duration_mins,
-            sa.avg_products_per_session,
-            now()
-        FROM behavioral b
-        LEFT JOIN category_affinity ca USING (customer_id)
-        LEFT JOIN purchase_velocity  pv USING (customer_id)
-        LEFT JOIN session_agg        sa USING (customer_id)
-        ON CONFLICT ON CONSTRAINT uq_customer_features_tenant_customer
+        SELECT $1::uuid,
+               customer_id,
+               category_affinity,
+               total_views, total_cart_adds, total_purchases,
+               distinct_products_viewed, distinct_categories_viewed,
+               days_since_first_seen, days_since_last_activity,
+               purchase_velocity_30d, avg_days_between_purchases,
+               total_revenue, avg_order_value,
+               avg_session_length_min, avg_products_per_session,
+               now()
+          FROM combined
+        ON CONFLICT (tenant_id, customer_id)
         DO UPDATE SET
-            total_views                 = EXCLUDED.total_views,
-            total_cart_adds             = EXCLUDED.total_cart_adds,
-            total_purchases             = EXCLUDED.total_purchases,
-            distinct_products_viewed    = EXCLUDED.distinct_products_viewed,
-            distinct_categories_viewed  = EXCLUDED.distinct_categories_viewed,
-            days_since_first_seen       = EXCLUDED.days_since_first_seen,
-            days_since_last_activity    = EXCLUDED.days_since_last_activity,
-            category_affinity           = EXCLUDED.category_affinity,
-            avg_days_between_purchases  = EXCLUDED.avg_days_between_purchases,
-            total_revenue               = EXCLUDED.total_revenue,
-            avg_order_value             = EXCLUDED.avg_order_value,
-            avg_session_duration_mins   = EXCLUDED.avg_session_duration_mins,
-            avg_products_per_session    = EXCLUDED.avg_products_per_session,
-            computed_at                 = EXCLUDED.computed_at
-        """,
-        tenant_id, active_ids,
-    )
-    return int(result.split()[-1])
+            category_affinity            = EXCLUDED.category_affinity,
+            total_views                  = EXCLUDED.total_views,
+            total_cart_adds              = EXCLUDED.total_cart_adds,
+            total_purchases              = EXCLUDED.total_purchases,
+            distinct_products_viewed     = EXCLUDED.distinct_products_viewed,
+            distinct_categories_viewed   = EXCLUDED.distinct_categories_viewed,
+            days_since_first_seen        = EXCLUDED.days_since_first_seen,
+            days_since_last_activity     = EXCLUDED.days_since_last_activity,
+            purchase_velocity_30d        = EXCLUDED.purchase_velocity_30d,
+            avg_days_between_purchases   = EXCLUDED.avg_days_between_purchases,
+            total_revenue                = EXCLUDED.total_revenue,
+            avg_order_value              = EXCLUDED.avg_order_value,
+            avg_session_length_min       = EXCLUDED.avg_session_length_min,
+            avg_products_per_session     = EXCLUDED.avg_products_per_session,
+            computed_at                  = now()
+    """
+
+    result = await conn.execute(sql, *params)
+    rows = int(result.split()[-1])
+    log.info("customer_features: upserted %d rows", rows)
+    return rows
 
 
-async def run_pipeline(tenant_id: str = None, full_refresh: bool = False):
-    conn = await asyncpg.connect(DSN)
+# ---------------------------------------------------------------------------
+# Product co-occurrence pipeline
+# ---------------------------------------------------------------------------
+
+async def compute_cooccurrence(conn, tenant_id: str, since: datetime | None):
+    """
+    Self-join on purchases: find all customer pairs that bought
+    two different products within 30 days of each other.
+
+    Stores BOTH (A→B) and (B→A) so top-N lookup is always a forward
+    index scan on product_a_id.
+
+    Confidence = co_count / distinct customers who bought A.
+    """
+    log.info("product_cooccurrence: since=%s", since)
+
+    thirty_days_ago = "now() - interval '30 days'"
+    if since is None:
+        window_filter = f"timestamp >= {thirty_days_ago}"
+        params = [tenant_id]
+    else:
+        window_filter = f"timestamp >= LEAST($2, {thirty_days_ago})"
+        params = [tenant_id, since]
+
+    sql = f"""
+        WITH purchases AS (
+            SELECT customer_id, product_id, timestamp
+              FROM events
+             WHERE tenant_id = $1::uuid
+               AND event_type = 'purchase'
+               AND {window_filter}
+        ),
+
+        pairs AS (
+            SELECT a.product_id AS product_a_id,
+                   b.product_id AS product_b_id,
+                   a.customer_id
+              FROM purchases a
+              JOIN purchases b
+                ON a.customer_id = b.customer_id
+               AND a.product_id <> b.product_id
+               AND ABS(EXTRACT(EPOCH FROM (a.timestamp - b.timestamp))) <= 2592000
+        ),
+
+        co_counts AS (
+            SELECT product_a_id,
+                   product_b_id,
+                   COUNT(DISTINCT customer_id) AS co_count
+              FROM pairs
+             GROUP BY product_a_id, product_b_id
+            HAVING COUNT(DISTINCT customer_id) >= 3
+        ),
+
+        product_buyers AS (
+            SELECT product_id,
+                   COUNT(DISTINCT customer_id) AS buyer_count
+              FROM purchases
+             GROUP BY product_id
+        ),
+
+        scored AS (
+            SELECT c.product_a_id,
+                   c.product_b_id,
+                   c.co_count,
+                   ROUND((c.co_count::numeric / pb.buyer_count), 4) AS confidence
+              FROM co_counts c
+              JOIN product_buyers pb ON pb.product_id = c.product_a_id
+        )
+
+        INSERT INTO product_cooccurrence
+            (tenant_id, product_a_id, product_b_id, co_count, confidence, updated_at)
+        SELECT $1::uuid,
+               product_a_id, product_b_id, co_count, confidence, now()
+          FROM scored
+        ON CONFLICT (tenant_id, product_a_id, product_b_id)
+        DO UPDATE SET
+            co_count   = EXCLUDED.co_count,
+            confidence = EXCLUDED.confidence,
+            updated_at = now()
+    """
+
+    result = await conn.execute(sql, *params)
+    rows = int(result.split()[-1])
+    log.info("product_cooccurrence: upserted %d rows", rows)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def run(tenant_id: str, full_refresh: bool):
+    conn = await asyncpg.connect(ADMIN_DSN)
     try:
-        tenants = [{"id": tenant_id}] if tenant_id else await get_tenants(conn)
+        now = datetime.now(tz=timezone.utc)
 
-        for tenant in tenants:
-            tid = str(tenant["id"])
-            print(f"\nTenant {tid}")
+        if full_refresh:
+            since_features     = None
+            since_cooccurrence = None
+            log.info("full refresh — ignoring checkpoints")
+        else:
+            since_features     = await get_checkpoint(conn, tenant_id, "customer_features")
+            since_cooccurrence = await get_checkpoint(conn, tenant_id, "product_cooccurrence")
 
-            since = (
-                datetime(2000, 1, 1, tzinfo=timezone.utc)
-                if full_refresh
-                else await get_checkpoint(conn, tid)
-            )
-            print(f"  checkpoint: {since.isoformat()}")
+        await compute_customer_features(conn, tenant_id, since_features)
+        await compute_cooccurrence(conn, tenant_id, since_cooccurrence)
 
-            run_started = datetime.now(timezone.utc)
-            n = await compute_customer_features(conn, tid, since)
-            print(f"  customer_features: {n} rows upserted")
+        await update_checkpoint(conn, tenant_id, "customer_features",     now)
+        await update_checkpoint(conn, tenant_id, "product_cooccurrence",  now)
 
-            await update_checkpoint(conn, tid, run_started)
-            print(f"  checkpoint updated")
+        log.info("pipeline complete for tenant %s", tenant_id)
     finally:
         await conn.close()
 
 
 if __name__ == "__main__":
-    tid = None
-    full_refresh = "--full-refresh" in sys.argv
-    for arg in sys.argv[1:]:
-        if not arg.startswith("--"):
-            tid = arg
-    asyncio.run(run_pipeline(tid, full_refresh))
+    parser = argparse.ArgumentParser(description="AIRA recommendation feature pipeline")
+    parser.add_argument("tenant_id", help="Tenant UUID")
+    parser.add_argument("--full-refresh", action="store_true",
+                        help="Ignore checkpoints and recompute from scratch")
+    args = parser.parse_args()
+
+    asyncio.run(run(args.tenant_id, args.full_refresh))
