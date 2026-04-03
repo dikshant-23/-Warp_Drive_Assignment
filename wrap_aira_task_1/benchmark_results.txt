@@ -1,0 +1,23 @@
+AIRA Platform — Benchmark Results
+==================================================
+
+Event Ingestion
+------------------------------
+  Total events   : 10,000
+  Batch size     : 500
+  Elapsed        : 0.47s
+  Target         : < 2.0s  [PASSED]
+  Throughput     : 21,214 events/sec
+  Errors         : 0
+
+Recommendation API Latency (uncached — unique customer per call)
+------------------------------
+  Calls          : 200
+  p50            : 1.56 ms
+  p95            : 2.18 ms  [target: < 100ms  PASSED]
+  p99            : 4.31 ms
+  mean           : 1.9 ms
+  max            : 59.6 ms
+
+  Note: Each call uses a unique customer_id to bypass Redis cache
+  and measure actual PostgreSQL query latency (cold-start path).
